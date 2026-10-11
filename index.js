@@ -40,6 +40,35 @@ function isStaff(member) {
   return false;
 }
 
+// ============ ตรวจลิงก์มัลแวร์/แสปม ============
+function extractHostname(raw) {
+  try {
+    return new URL(raw).hostname.toLowerCase();
+  } catch {
+    return raw
+      .replace(/^https?:\/\//i, "")
+      .split(/[/?#:]/)[0]
+      .toLowerCase();
+  }
+}
+
+function isMalwareUrl(content) {
+  const urls =
+    content.match(/https?:\/\/[^\s<>"'{}]+/gi) ||
+    content.match(/www\.[^\s<>"'{}]+/gi);
+  if (!urls) return false;
+
+  const blocked = config.malwareDomains.map((d) =>
+    d.toLowerCase().replace(/^\./, "")
+  );
+  for (const url of urls) {
+    const host = extractHostname(url);
+    if (blocked.some((dom) => host === dom || host.endsWith(`.${dom}`)))
+      return true;
+  }
+  return false;
+}
+
 // ============ Mute ============
 async function ensureMuteRole(guild) {
   let role = guild.roles.cache.find((r) => r.name === "Anti-Spam Mute");
@@ -56,12 +85,12 @@ async function ensureMuteRole(guild) {
   return role;
 }
 
-async function muteUser(member, guild) {
-  const timeoutSeconds = config.muteDuration / 1000;
+async function muteUser(member, guild, duration = config.muteDuration) {
+  const timeoutSeconds = duration / 1000;
   const me = guild.members.me;
 
   if (me.permissions.has(PermissionFlagsBits.ModerateMembers)) {
-    await member.timeout(config.muteDuration, "กันแสปม");
+    await member.timeout(duration, "ลงโทษแสปม");
     return timeoutSeconds;
   }
 
@@ -71,37 +100,50 @@ async function muteUser(member, guild) {
   await member.roles.add(muteRole);
   setTimeout(async () => {
     await member.roles.remove(muteRole).catch(() => {});
-  }, config.muteDuration);
+  }, duration);
   return timeoutSeconds;
 }
 
 // ลบข้อความแสปมของผู้ใช้เฉพาะในช่องธรรมดา
 // ข้าม thread / โพสต์ฟอรั่ม / คอมเมนต์ใต้โพส (โซน "โพส") ไม่ลบ
 async function purgeUserMessages(guild, userId) {
-  let deleted = 0;
   const oldestAllowed = Date.now() - config.purgeWindowHours * 60 * 60 * 1000;
   const allowedTypes = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
-  for (const channel of guild.channels.cache.values()) {
-    if (!allowedTypes.includes(channel.type)) continue;
-    if (!channel.isTextBased()) continue;
-    if (!channel.viewable) continue;
-    if (!channel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ManageMessages)) continue;
-    try {
-      const messages = await channel.messages.fetch({ limit: config.purgePerChannel });
-      const toDelete = messages.filter(
-        (m) =>
-          m.author.id === userId &&
-          m.createdTimestamp >= oldestAllowed &&
-          m.deletable
-      );
-      if (toDelete.size > 0) {
-        await channel.bulkDelete(toDelete, true);
-        deleted += toDelete.size;
-      }
-    } catch {}
-  }
-  return deleted;
+  const results = await Promise.all(
+    Array.from(guild.channels.cache.values(), async (channel) => {
+      if (!allowedTypes.includes(channel.type)) return 0;
+      if (!channel.isTextBased()) return 0;
+      if (!channel.viewable) return 0;
+      if (!channel.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ManageMessages)) return 0;
+      try {
+        const messages = await channel.messages.fetch({ limit: config.purgePerChannel });
+        const toDelete = messages.filter(
+          (m) =>
+            m.author.id === userId &&
+            m.createdTimestamp >= oldestAllowed &&
+            m.deletable
+        );
+        if (toDelete.size > 0) {
+          await channel.bulkDelete(toDelete, true);
+          return toDelete.size;
+        }
+      } catch {}
+      return 0;
+    })
+  );
+
+  return results.reduce((sum, n) => sum + n, 0);
+}
+
+// ไล่ลบข้อความเก่าของผู้ต้องสงสัยแบบ background (ไม่บล็อกคำสั่ง mute/ban)
+function purgeInBackground(guild, userId, reason) {
+  purgeUserMessages(guild, userId)
+    .then((n) => {
+      if (n > 0)
+        console.log(`🧹 ลบข้อความของ ${userId} แล้ว ${n} ชิ้น (${reason})`);
+    })
+    .catch(() => {});
 }
 
 // ============ Events ============
@@ -115,6 +157,13 @@ client.once("ready", () => {
     console.log(`📂 ${g.name}: ${channels.join(", ")}`);
   });
   client.user.setActivity("กันแสปม", { type: 3 });
+
+  // ไล่ลบข้อความแจ้งเตือนเก่าที่บอทเคยส่งทิ้งไว้ (หลังบ้าน หลังบูต 10 วินาที)
+  setTimeout(() => {
+    client.guilds.cache.forEach((g) => {
+      purgeInBackground(g, client.user.id, "ข้อความแจ้งเตือนเก่าของบอท");
+    });
+  }, 10000);
 });
 
 client.on("messageCreate", async (message) => {
@@ -128,12 +177,17 @@ client.on("messageCreate", async (message) => {
       .catch(() => null));
   if (!member) return;
 
+  if (isStaff(member)) return;
+
   // ห้ามพิมพ์ในช่อง bannedChannels → ลบ + แบนถาวร
   if (config.bannedChannels.includes(message.channel.id)) {
     return handleBannedChannel(message);
   }
 
-  if (isStaff(member)) return;
+  // ลิงก์มัลแวร์/แสปม → ลบ + mute ในทุกช่อง
+  if (config.malwareDomains.length && isMalwareUrl(message.content)) {
+    return handleMalwareUrl(message);
+  }
 
   const key = keyFor(message.guild.id, message.author.id);
   const now = Date.now();
@@ -186,17 +240,13 @@ async function handleBannedChannel(message) {
     await message.delete();
   } catch {}
   try {
-    // แบนถาวร (ไม่ใช้ deleteMessageSeconds เพราะต้องเลือกช่องลบเอง) + ลบข้อความแสปมเฉพาะช่องธรรมดา
-    const deleted = await purgeUserMessages(message.guild, message.author.id);
     await message.member.ban({
       reason: "พิมพ์ข้อความใน channel ต้องห้าม",
     });
-    console.log(`🔨 แบน: ${message.author.tag}, ลบข้อความ ${deleted} ชิ้น (channel ต้องห้าม)`);
+    purgeInBackground(message.guild, message.author.id, "channel ต้องห้าม");
+    console.log(`🔨 แบน: ${message.author.tag} (channel ต้องห้าม) ทำงานหลังบ้านสำเร็จ`);
   } catch (err) {
     console.error("Ban error:", err);
-    await message.channel
-      .send(`⚠️ ต้องการแบน <@${message.author.id}> แต่บอทไม่มีสิทธิ์ (Permissions: BanMembers)`)
-      .catch(() => {});
   }
 }
 
@@ -211,17 +261,27 @@ async function handleSpam(message, reason) {
   } catch {}
 
   try {
-    // ลบข้อความแสปมในช่องธรรมดา (ข้ามโซนโพส) แล้วค่อย mute
-    const deleted = await purgeUserMessages(message.guild, message.author.id);
     const timeoutSeconds = await muteUser(message.member, message.guild);
-    await message.channel
-      .send(`⛔ <@${message.author.id}> ถูก mute ${timeoutSeconds / 60} นาที (${reason})${deleted ? ` ลบข้อความแสปม ${deleted} ชิ้น` : ""}`)
-      .catch(() => {});
+    purgeInBackground(message.guild, message.author.id, reason);
+    console.log(`⛔ mute ${message.author.tag} เป็นเวลา ${timeoutSeconds / 60} นาที (${reason}) ทำงานหลังบ้านสำเร็จ`);
   } catch (err) {
     console.error("Anti-spam error:", err);
-    await message.channel
-      .send(`⚠️ ตรวจพบการแสปมจาก <@${message.author.id}> (${reason})`)
-      .catch(() => {});
+  }
+}
+
+async function handleMalwareUrl(message) {
+  try {
+    await message.delete();
+  } catch {}
+
+  try {
+    await message.member.ban({
+      reason: "ส่งลิงก์มัลแวร์/แสปม",
+    });
+    purgeInBackground(message.guild, message.author.id, "ลิงก์มัลแวร์");
+    console.log(`🚫 แบน: ${message.author.tag} (ลิงก์มัลแวร์) ทำงานหลังบ้านสำเร็จ`);
+  } catch (err) {
+    console.error("Malware handler error:", err);
   }
 }
 
